@@ -80,6 +80,36 @@ extension CassandraClient {
                         buffer.baseAddress,
                         buffer.count
                     )
+                case .encryptedString(let wrapped, let context):
+                    result = try self.bindEncrypted(
+                        Data(wrapped.value.utf8), context: context, options: options, at: index
+                    )
+                case .encryptedBytes(let wrapped, let context):
+                    result = try self.bindEncrypted(
+                        Data(wrapped.value), context: context, options: options, at: index
+                    )
+                case .encryptedInt32(let wrapped, let context):
+                    var bigEndian = wrapped.value.bigEndian
+                    result = try self.bindEncrypted(
+                        Data(bytes: &bigEndian, count: 4), context: context, options: options, at: index
+                    )
+                case .encryptedInt64(let wrapped, let context):
+                    var bigEndian = wrapped.value.bigEndian
+                    result = try self.bindEncrypted(
+                        Data(bytes: &bigEndian, count: 8), context: context, options: options, at: index
+                    )
+                case .encryptedDouble(let wrapped, let context):
+                    var bits = wrapped.value.bitPattern.bigEndian
+                    result = try self.bindEncrypted(
+                        Data(bytes: &bits, count: 8), context: context, options: options, at: index
+                    )
+                case .encryptedUUID(let wrapped, let context):
+                    let u = wrapped.value.uuid
+                    let plaintext = Data([u.0, u.1, u.2, u.3, u.4, u.5, u.6, u.7,
+                                          u.8, u.9, u.10, u.11, u.12, u.13, u.14, u.15])
+                    result = try self.bindEncrypted(
+                        plaintext, context: context, options: options, at: index
+                    )
                 case .int8Array(let array):
                     result = try self.bindArray(array, at: index)
                 case .int16Array(let array):
@@ -111,6 +141,29 @@ extension CassandraClient {
 
             if let requestTimeout = options.requestTimeout {
                 try checkResult { cass_statement_set_request_timeout(self.rawPointer, requestTimeout) }
+            }
+        }
+
+        /// Encrypt plaintext and bind the result as bytes at the given parameter index.
+        private func bindEncrypted(
+            _ plaintext: Data,
+            context: EncryptionContext,
+            options: Options,
+            at index: Int
+        ) throws -> CassError {
+            guard #available(macOS 11.0, *) else {
+                throw CassandraClient.Error.encryptionError("Encryption requires macOS 11.0+")
+            }
+            guard let encryptor = options.encryptor else {
+                throw CassandraClient.Error.encryptionConfigError(
+                    "Encryptor required but not set in Options"
+                )
+            }
+            let encrypted = try encryptor.encrypt(plaintext, context: context)
+            let this = self
+            return encrypted.withUnsafeBytes { buffer in
+                let typed = buffer.bindMemory(to: UInt8.self)
+                return cass_statement_bind_bytes(this.rawPointer, index, typed.baseAddress, typed.count)
             }
         }
 
@@ -200,6 +253,13 @@ extension CassandraClient {
             case bytes([UInt8])
             case bytesUnsafe(UnsafeBufferPointer<UInt8>)
 
+            case encryptedString(Encrypted<String>, context: EncryptionContext)
+            case encryptedBytes(Encrypted<[UInt8]>, context: EncryptionContext)
+            case encryptedInt32(Encrypted<Int32>, context: EncryptionContext)
+            case encryptedInt64(Encrypted<Int64>, context: EncryptionContext)
+            case encryptedDouble(Encrypted<Double>, context: EncryptionContext)
+            case encryptedUUID(Encrypted<Foundation.UUID>, context: EncryptionContext)
+
             case int8Array([Int8])
             case int16Array([Int16])
             case int32Array([Int32])
@@ -284,6 +344,14 @@ extension CassandraClient {
             public var consistency: CassandraClient.Consistency?
             /// Sets the statement's request timeout in milliseconds. Default is `CASS_UINT64_MAX`
             public var requestTimeout: UInt64?
+            /// Optional encryptor for encrypting parameters marked as encrypted.
+            @available(macOS 11.0, *)
+            public var encryptor: Encryptor? {
+                get { self._encryptor as? Encryptor }
+                set { self._encryptor = newValue }
+            }
+
+            private var _encryptor: AnyObject?
 
             public init(consistency: CassandraClient.Consistency? = nil, requestTimeout: UInt64? = nil) {
                 self.consistency = consistency
