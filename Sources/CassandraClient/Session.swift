@@ -163,7 +163,20 @@ extension CassandraSession {
         self.query(query, parameters: parameters, options: options, on: eventLoop, logger: logger)
             .flatMapThrowing { rows in
                 try rows.map { row in
-                    try T(from: CassandraClient.RowDecoder(row: row))
+                    let decoder: CassandraClient.RowDecoder
+                    if let builder = options.encryptionContextBuilder,
+                       #available(macOS 11.0, *),
+                       let encryptor = options.encryptor
+                    {
+                        let ctx = try builder(row)
+                        decoder = CassandraClient.RowDecoder(
+                            row: row, encryptor: encryptor,
+                            keyspace: ctx.keyspace, table: ctx.table, primaryKey: ctx.primaryKey
+                        )
+                    } else {
+                        decoder = CassandraClient.RowDecoder(row: row)
+                    }
+                    return try T(from: decoder)
                 }
             }
     }
@@ -459,7 +472,20 @@ extension CassandraSession {
             logger: logger
         )
         return try rows.map { row in
-            try T(from: CassandraClient.RowDecoder(row: row))
+            let decoder: CassandraClient.RowDecoder
+            if let builder = options.encryptionContextBuilder,
+               #available(macOS 11.0, *),
+               let encryptor = options.encryptor
+            {
+                let ctx = try builder(row)
+                decoder = CassandraClient.RowDecoder(
+                    row: row, encryptor: encryptor,
+                    keyspace: ctx.keyspace, table: ctx.table, primaryKey: ctx.primaryKey
+                )
+            } else {
+                decoder = CassandraClient.RowDecoder(row: row)
+            }
+            return try T(from: decoder)
         }
     }
 

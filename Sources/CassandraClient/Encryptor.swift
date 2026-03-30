@@ -42,16 +42,33 @@ extension CassandraClient {
 
         // TODO: Add convenience method like withColumn("credit_card") to create a new context
         // with a different column but same keyspace, table, and primaryKey.
+        // TODO: Add convenience method like withPrimaryKey(Data(...)) to create a new context
+        // with a different primary key but same keyspace, table, and column.
     }
 }
 
 // MARK: - Encrypted wrapper
 
 extension CassandraClient {
-    /// Wrapper that marks a value for transparent encryption on the write path.
-    public struct Encrypted<T> {
+    /// Wrapper that marks a value for transparent encryption on the write path
+    /// and decryption on the read path via Codable.
+    public struct Encrypted<T>: Codable where T: Codable {
         public let value: T
         public init(_ value: T) { self.value = value }
+
+        public init(from decoder: Decoder) throws {
+            // Decoding is handled by RowDecodingContainer.decryptColumn,
+            // not here. This conformance exists so Encrypted<T> satisfies
+            // the Codable requirement on struct fields.
+            throw CassandraClient.Error.decryptionError(
+                "Encrypted<T> should be decoded via RowDecoder, not directly"
+            )
+        }
+
+        public func encode(to encoder: Encoder) throws {
+            var container = encoder.singleValueContainer()
+            try container.encode(self.value)
+        }
     }
 }
 
@@ -364,4 +381,13 @@ extension CassandraClient {
             }
         }
     }
+}
+
+// MARK: - CodingUserInfoKey extensions for encryption
+
+extension CodingUserInfoKey {
+    static let cassandraEncryptor = CodingUserInfoKey(rawValue: "cassandraEncryptor")!
+    static let cassandraKeyspace = CodingUserInfoKey(rawValue: "cassandraKeyspace")!
+    static let cassandraTable = CodingUserInfoKey(rawValue: "cassandraTable")!
+    static let cassandraPrimaryKey = CodingUserInfoKey(rawValue: "cassandraPrimaryKey")!
 }

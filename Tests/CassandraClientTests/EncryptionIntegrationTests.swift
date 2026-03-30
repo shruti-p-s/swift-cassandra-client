@@ -1,0 +1,380 @@
+//===----------------------------------------------------------------------===//
+//
+// This source file is part of the Swift Cassandra Client open source project
+//
+// Copyright (c) 2022-2025 Apple Inc. and the Swift Cassandra Client project authors
+// Licensed under Apache License v2.0
+//
+// See LICENSE.txt for license information
+// See CONTRIBUTORS.txt for the list of Swift Cassandra Client project authors
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+//===----------------------------------------------------------------------===//
+
+import Foundation
+import Logging
+import NIO
+import XCTest
+
+@testable import CassandraClient
+
+@available(macOS 11.0, *)
+final class EncryptionIntegrationTests: XCTestCase {
+    var cassandraClient: CassandraClient!
+    var configuration: CassandraClient.Configuration!
+    var encryptor: CassandraClient.Encryptor!
+
+    private let keyName = "test-key"
+    private lazy var keyData: Data = {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        for i in 0 ..< bytes.count {
+            bytes[i] = UInt8.random(in: 0 ... 255)
+        }
+        return Data(bytes)
+    }()
+
+    override func setUp() {
+        super.setUp()
+
+        let env = ProcessInfo.processInfo.environment
+        let keyspace = env["CASSANDRA_KEYSPACE"] ?? "test"
+        self.configuration = CassandraClient.Configuration(
+            contactPointsProvider: { callback in
+                callback(.success([env["CASSANDRA_HOST"] ?? "127.0.0.1"]))
+            },
+            port: env["CASSANDRA_CQL_PORT"].flatMap(Int32.init) ?? 9042,
+            protocolVersion: .v3
+        )
+        self.configuration.username = env["CASSANDRA_USER"]
+        self.configuration.password = env["CASSANDRA_PASSWORD"]
+        self.configuration.keyspace = keyspace
+        self.configuration.requestTimeoutMillis = UInt32(24_000)
+        self.configuration.connectTimeoutMillis = UInt32(10_000)
+
+        self.encryptor = try! CassandraClient.Encryptor(
+            keyMap: [keyName: keyData],
+            currentKeyName: keyName
+        )
+
+        var logger = Logger(label: "test")
+        logger.logLevel = .debug
+
+        self.cassandraClient = CassandraClient(configuration: self.configuration, logger: logger)
+        XCTAssertNoThrow(
+            try self.cassandraClient.withSession(keyspace: .none) { session in
+                try session
+                    .run(
+                        "create keyspace if not exists \(keyspace) with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 }"
+                    )
+                    .wait()
+            }
+        )
+    }
+
+    override func tearDown() {
+        super.tearDown()
+        XCTAssertNoThrow(try self.cassandraClient.shutdown())
+        self.cassandraClient = nil
+    }
+
+    // MARK: - Write path + manual read path
+
+    /// Insert an encrypted string via Statement, read it back using Column.decryptedString.
+    func testWriteAndManualRead() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_\(DispatchTime.now().uptimeNanoseconds)"
+
+        // Create table: user_id (primary key) + secret (encrypted, stored as blob)
+        try session.run("create table \(tableName) (user_id text primary key, secret blob)").wait()
+
+        // Insert with encrypted string
+        let userId = "user-1"
+        let secretValue = "my-ssn-number"
+
+        let context = CassandraClient.EncryptionContext(
+            keyspace: self.configuration.keyspace!,
+            table: tableName,
+            column: "secret",
+            primaryKey: Data(userId.utf8)
+        )
+
+        var options = CassandraClient.Statement.Options()
+        options.encryptor = self.encryptor
+
+        try session.run(
+            "insert into \(tableName) (user_id, secret) values (?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(secretValue), context: context),
+            ],
+            options: options
+        ).wait()
+
+        // Read back using manual decryption
+        let rows = try session.query("select * from \(tableName) where user_id = ?", parameters: [.string(userId)]).wait()
+        let rowArray = Array(rows)
+        XCTAssertEqual(rowArray.count, 1)
+
+        let row = rowArray[0]
+
+        // The raw bytes should NOT equal the plaintext (it's encrypted)
+        let rawBytes: [UInt8]? = row.column("secret")
+        XCTAssertNotNil(rawBytes)
+        XCTAssertNotEqual(rawBytes.map { Data($0) }, Data(secretValue.utf8))
+
+        // Decrypt manually
+        let decrypted = try row.column("secret")?.decryptedString(
+            encryptor: self.encryptor,
+            context: context
+        )
+        XCTAssertEqual(decrypted, secretValue)
+    }
+
+    // MARK: - Codable read path
+
+    /// Insert encrypted data, read it back using the Codable path with Encrypted<String>.
+    func testCodableDecrypt() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_codable_\(DispatchTime.now().uptimeNanoseconds)"
+
+        try session.run("create table \(tableName) (user_id text primary key, secret blob)").wait()
+
+        let userId = "user-codable"
+        let secretValue = "codable-secret-value"
+
+        let writeContext = CassandraClient.EncryptionContext(
+            keyspace: self.configuration.keyspace!,
+            table: tableName,
+            column: "secret",
+            primaryKey: Data(userId.utf8)
+        )
+
+        var writeOptions = CassandraClient.Statement.Options()
+        writeOptions.encryptor = self.encryptor
+
+        try session.run(
+            "insert into \(tableName) (user_id, secret) values (?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(secretValue), context: writeContext),
+            ],
+            options: writeOptions
+        ).wait()
+
+        // Read back using Codable path
+        var readOptions = CassandraClient.Statement.Options()
+        readOptions.encryptor = self.encryptor
+        readOptions.encryptionContextBuilder = { row in
+            guard let uid: String = row.column("user_id") else {
+                throw CassandraClient.Error.badParams("user_id not found in row")
+            }
+            return (
+                keyspace: self.configuration.keyspace!,
+                table: tableName,
+                primaryKey: Data(uid.utf8)
+            )
+        }
+
+        let results: [UserWithSecret] = try session.query(
+            "select user_id, secret from \(tableName) where user_id = ?",
+            parameters: [.string(userId)],
+            options: readOptions
+        ).wait()
+
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results[0].user_id, userId)
+        XCTAssertEqual(results[0].secret.value, secretValue)
+    }
+
+    // MARK: - All types
+
+    /// Write and read back all encrypted types: String, Int32, Int64, Double, UUID, [UInt8].
+    func testAllEncryptedTypes() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_all_\(DispatchTime.now().uptimeNanoseconds)"
+
+        try session.run(
+            "create table \(tableName) (user_id text primary key, enc_name blob, enc_age blob, enc_count blob, enc_score blob, enc_id blob, enc_data blob)"
+        ).wait()
+
+        let userId = "user-all"
+        let name = "Alice"
+        let age: Int32 = 30
+        let count: Int64 = 9_876_543_210
+        let score: Double = 99.5
+        let id = Foundation.UUID()
+        let data: [UInt8] = [0xDE, 0xAD, 0xBE, 0xEF]
+        let keyspace = self.configuration.keyspace!
+
+        func ctx(_ column: String) -> CassandraClient.EncryptionContext {
+            CassandraClient.EncryptionContext(
+                keyspace: keyspace, table: tableName, column: column, primaryKey: Data(userId.utf8)
+            )
+        }
+
+        var options = CassandraClient.Statement.Options()
+        options.encryptor = self.encryptor
+
+        try session.run(
+            "insert into \(tableName) (user_id, enc_name, enc_age, enc_count, enc_score, enc_id, enc_data) values (?, ?, ?, ?, ?, ?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(name), context: ctx("enc_name")),
+                .encryptedInt32(CassandraClient.Encrypted(age), context: ctx("enc_age")),
+                .encryptedInt64(CassandraClient.Encrypted(count), context: ctx("enc_count")),
+                .encryptedDouble(CassandraClient.Encrypted(score), context: ctx("enc_score")),
+                .encryptedUUID(CassandraClient.Encrypted(id), context: ctx("enc_id")),
+                .encryptedBytes(CassandraClient.Encrypted(data), context: ctx("enc_data")),
+            ],
+            options: options
+        ).wait()
+
+        // Read back manually
+        let rows = try session.query(
+            "select * from \(tableName) where user_id = ?",
+            parameters: [.string(userId)]
+        ).wait()
+        let row = Array(rows)[0]
+
+        XCTAssertEqual(try row.column("enc_name")?.decryptedString(encryptor: self.encryptor, context: ctx("enc_name")), name)
+        XCTAssertEqual(try row.column("enc_age")?.decryptedInt32(encryptor: self.encryptor, context: ctx("enc_age")), age)
+        XCTAssertEqual(try row.column("enc_count")?.decryptedInt64(encryptor: self.encryptor, context: ctx("enc_count")), count)
+        XCTAssertEqual(try row.column("enc_score")?.decryptedDouble(encryptor: self.encryptor, context: ctx("enc_score")), score)
+        XCTAssertEqual(try row.column("enc_id")?.decryptedUUID(encryptor: self.encryptor, context: ctx("enc_id")), id)
+        XCTAssertEqual(try row.column("enc_data")?.decryptedBytes(encryptor: self.encryptor, context: ctx("enc_data")), data)
+    }
+
+    // MARK: - Multiple rows with Codable
+
+    /// Insert 3 rows, read all back via Codable, verify each decrypts with its own primaryKey.
+    func testCodableMultipleRows() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_multi_\(DispatchTime.now().uptimeNanoseconds)"
+        let keyspace = self.configuration.keyspace!
+
+        try session.run("create table \(tableName) (user_id text primary key, secret blob)").wait()
+
+        let users = [
+            ("alice", "alice-secret"),
+            ("bob", "bob-secret"),
+            ("charlie", "charlie-secret"),
+        ]
+
+        var options = CassandraClient.Statement.Options()
+        options.encryptor = self.encryptor
+        options.encryptionContextBuilder = { row in
+            guard let uid: String = row.column("user_id") else {
+                throw CassandraClient.Error.badParams("user_id not found in row")
+            }
+            return (keyspace: keyspace, table: tableName, primaryKey: Data(uid.utf8))
+        }
+
+        for (userId, secretValue) in users {
+            let context = CassandraClient.EncryptionContext(
+                keyspace: keyspace, table: tableName, column: "secret", primaryKey: Data(userId.utf8)
+            )
+            try session.run(
+                "insert into \(tableName) (user_id, secret) values (?, ?)",
+                parameters: [
+                    .string(userId),
+                    .encryptedString(CassandraClient.Encrypted(secretValue), context: context),
+                ],
+                options: options
+            ).wait()
+        }
+
+        // Read all back via Codable
+        let results: [UserWithSecret] = try session.query(
+            "select user_id, secret from \(tableName)",
+            options: options
+        ).wait()
+
+        XCTAssertEqual(results.count, 3)
+
+        // Sort by user_id since Cassandra doesn't guarantee order
+        let sorted = results.sorted { $0.user_id < $1.user_id }
+        for (i, (expectedId, expectedSecret)) in users.sorted(by: { $0.0 < $1.0 }).enumerated() {
+            XCTAssertEqual(sorted[i].user_id, expectedId)
+            XCTAssertEqual(sorted[i].secret.value, expectedSecret)
+        }
+    }
+
+    // MARK: - Codable with multiple encrypted columns
+
+    /// Struct with two Encrypted fields of different types, decoded via Codable.
+    func testCodableMultipleEncryptedColumns() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_multi_col_\(DispatchTime.now().uptimeNanoseconds)"
+        let keyspace = self.configuration.keyspace!
+
+        try session.run(
+            "create table \(tableName) (user_id text primary key, secret_name blob, secret_age blob)"
+        ).wait()
+
+        let userId = "user-multi-col"
+        let name = "Alice"
+        let age: Int32 = 30
+        let primaryKeyData = Data(userId.utf8)
+
+        func ctx(_ column: String) -> CassandraClient.EncryptionContext {
+            CassandraClient.EncryptionContext(
+                keyspace: keyspace, table: tableName, column: column, primaryKey: primaryKeyData
+            )
+        }
+
+        var options = CassandraClient.Statement.Options()
+        options.encryptor = self.encryptor
+        options.encryptionContextBuilder = { row in
+            guard let uid: String = row.column("user_id") else {
+                throw CassandraClient.Error.badParams("user_id not found in row")
+            }
+            return (keyspace: keyspace, table: tableName, primaryKey: Data(uid.utf8))
+        }
+
+        try session.run(
+            "insert into \(tableName) (user_id, secret_name, secret_age) values (?, ?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(name), context: ctx("secret_name")),
+                .encryptedInt32(CassandraClient.Encrypted(age), context: ctx("secret_age")),
+            ],
+            options: options
+        ).wait()
+
+        // Read back via Codable
+        let results: [UserWithMultipleSecrets] = try session.query(
+            "select user_id, secret_name, secret_age from \(tableName) where user_id = ?",
+            parameters: [.string(userId)],
+            options: options
+        ).wait()
+
+        XCTAssertEqual(results.count, 1)
+        XCTAssertEqual(results[0].user_id, userId)
+        XCTAssertEqual(results[0].secret_name.value, name)
+        XCTAssertEqual(results[0].secret_age.value, age)
+    }
+}
+
+// MARK: - Test model
+
+struct UserWithSecret: Decodable {
+    let user_id: String
+    let secret: CassandraClient.Encrypted<String>
+}
+
+struct UserWithMultipleSecrets: Decodable {
+    let user_id: String
+    let secret_name: CassandraClient.Encrypted<String>
+    let secret_age: CassandraClient.Encrypted<Int32>
+}

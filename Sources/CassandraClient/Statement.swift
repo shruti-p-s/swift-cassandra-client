@@ -353,6 +353,10 @@ extension CassandraClient {
 
             private var _encryptor: AnyObject?
 
+            /// Closure that extracts encryption context from each row during Codable decoding.
+            /// Returns (keyspace, table, primaryKey) for the encryption-aware RowDecoder.
+            public var encryptionContextBuilder: ((CassandraClient.Row) throws -> (keyspace: String, table: String, primaryKey: Data))?
+
             public init(consistency: CassandraClient.Consistency? = nil, requestTimeout: UInt64? = nil) {
                 self.consistency = consistency
                 self.requestTimeout = requestTimeout
