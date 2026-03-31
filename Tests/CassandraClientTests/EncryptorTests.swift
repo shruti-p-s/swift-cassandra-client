@@ -338,7 +338,7 @@ final class EncryptorTests: XCTestCase {
         let iterations = 100
 
         let group = DispatchGroup()
-        var errors = [Swift.Error]()
+        var errors = [Error]()
         let errorLock = NSLock()
 
         for i in 0 ..< iterations {
