@@ -26,13 +26,15 @@ final class EncryptionIntegrationTests: XCTestCase {
     var encryptor: CassandraClient.Encryptor!
 
     private let keyName = "test-key"
-    private lazy var keyData: Data = {
+    private lazy var keyData: Data = randomKey()
+
+    private func randomKey() -> Data {
         var bytes = [UInt8](repeating: 0, count: 32)
         for i in 0 ..< bytes.count {
             bytes[i] = UInt8.random(in: 0 ... 255)
         }
         return Data(bytes)
-    }()
+    }
 
     override func setUp() {
         super.setUp()
@@ -363,6 +365,117 @@ final class EncryptionIntegrationTests: XCTestCase {
         XCTAssertEqual(results[0].user_id, userId)
         XCTAssertEqual(results[0].secret_name.value, name)
         XCTAssertEqual(results[0].secret_age.value, age)
+    }
+
+    // MARK: - Key rotation + re-encryption
+
+    /// Full lifecycle: write with key-1, rotate to key-2, old data still reads,
+    /// re-encrypt old data with key-2, verify it now uses key-2.
+    func testKeyRotationAndReEncryption() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_rotate_\(DispatchTime.now().uptimeNanoseconds)"
+        let keyspace = self.configuration.keyspace!
+
+        try session.run("create table \(tableName) (user_id text primary key, secret blob)").wait()
+
+        let userId = "user-rotate"
+        let secretValue = "rotate-me"
+        let context = CassandraClient.EncryptionContext(
+            keyspace: keyspace, table: tableName, column: "secret", primaryKey: Data(userId.utf8)
+        )
+
+        // Step 1: Write with key-1 (the encryptor from setUp uses "test-key")
+        var options = CassandraClient.Statement.Options()
+        options.encryptor = self.encryptor
+
+        try session.run(
+            "insert into \(tableName) (user_id, secret) values (?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(secretValue), context: context),
+            ],
+            options: options
+        ).wait()
+
+        // Step 2: Rotate — add key-2, switch to it
+        try self.encryptor.addKey(name: "key-2", secret: randomKey())
+        try self.encryptor.setCurrentKeyName("key-2")
+
+        // Step 3: Old data still decrypts (key-1 is still in the map)
+        let rows = try session.query(
+            "select * from \(tableName) where user_id = ?",
+            parameters: [.string(userId)]
+        ).wait()
+        let row = Array(rows)[0]
+        let decrypted = try row.column("secret")?.decryptedString(
+            encryptor: self.encryptor, context: context
+        )
+        XCTAssertEqual(decrypted, secretValue)
+
+        // Step 4: Re-encrypt with key-2 (read plaintext, write back encrypted with new key)
+        try session.run(
+            "insert into \(tableName) (user_id, secret) values (?, ?)",
+            parameters: [
+                .string(userId),
+                .encryptedString(CassandraClient.Encrypted(secretValue), context: context),
+            ],
+            options: options
+        ).wait()
+
+        // Step 5: Verify re-encrypted data still decrypts
+        let rows2 = try session.query(
+            "select * from \(tableName) where user_id = ?",
+            parameters: [.string(userId)]
+        ).wait()
+        let row2 = Array(rows2)[0]
+        let decrypted2 = try row2.column("secret")?.decryptedString(
+            encryptor: self.encryptor, context: context
+        )
+        XCTAssertEqual(decrypted2, secretValue)
+
+        // Step 6: Verify the envelope now contains "key-2"
+        let rawBytes: [UInt8]? = row2.column("secret")
+        let envelope = Data(rawBytes!)
+        // Envelope format: [version:1][algorithm:1][key-name-len:1][key-name:N]...
+        let keyNameLen = Int(envelope[2])
+        let keyName = String(data: envelope[3 ..< 3 + keyNameLen], encoding: .utf8)
+        XCTAssertEqual(keyName, "key-2")
+    }
+
+    // MARK: - Null encrypted column
+
+    /// A null encrypted column should return nil, not crash.
+    func testNullEncryptedColumn() throws {
+        let session = self.cassandraClient.makeSession(keyspace: self.configuration.keyspace)
+        defer { XCTAssertNoThrow(try session.shutdown()) }
+
+        let tableName = "test_enc_null_\(DispatchTime.now().uptimeNanoseconds)"
+        let keyspace = self.configuration.keyspace!
+
+        try session.run("create table \(tableName) (user_id text primary key, secret blob)").wait()
+
+        // Insert a row without setting the encrypted column
+        try session.run(
+            "insert into \(tableName) (user_id) values (?)",
+            parameters: [.string("user-null")]
+        ).wait()
+
+        let rows = try session.query(
+            "select * from \(tableName) where user_id = ?",
+            parameters: [.string("user-null")]
+        ).wait()
+        let row = Array(rows)[0]
+
+        let context = CassandraClient.EncryptionContext(
+            keyspace: keyspace, table: tableName, column: "secret", primaryKey: Data("user-null".utf8)
+        )
+
+        let decrypted = try row.column("secret")?.decryptedString(
+            encryptor: self.encryptor, context: context
+        )
+        XCTAssertNil(decrypted)
     }
 }
 

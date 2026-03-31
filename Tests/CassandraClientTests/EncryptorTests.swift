@@ -292,4 +292,80 @@ final class EncryptorTests: XCTestCase {
         let encrypted = try encryptor.encrypt(Data("secret".utf8), context: contextA)
         XCTAssertThrowsError(try encryptor.decrypt(encrypted, context: contextB))
     }
+
+    // MARK: - setKeyMap validation
+
+    /// Cannot remove an existing key from the map.
+    func testSetKeyMapCannotRemoveKey() throws {
+        let key1 = randomKey()
+        let key2 = randomKey()
+        let encryptor = try CassandraClient.Encryptor(
+            keyMap: ["key-1": key1, "key-2": key2],
+            currentKeyName: "key-1"
+        )
+        // New map missing "key-2" — should throw
+        XCTAssertThrowsError(try encryptor.setKeyMap(["key-1": key1]))
+    }
+
+    /// Cannot change an existing key's bytes.
+    func testSetKeyMapCannotChangeKey() throws {
+        let key1 = randomKey()
+        let encryptor = try CassandraClient.Encryptor(
+            keyMap: ["key-1": key1],
+            currentKeyName: "key-1"
+        )
+        // Same name, different bytes — should throw
+        XCTAssertThrowsError(try encryptor.setKeyMap(["key-1": randomKey()]))
+    }
+
+    /// Can add a new key via setKeyMap while keeping existing ones.
+    func testSetKeyMapCanAddKey() throws {
+        let key1 = randomKey()
+        let encryptor = try CassandraClient.Encryptor(
+            keyMap: ["key-1": key1],
+            currentKeyName: "key-1"
+        )
+        let key2 = randomKey()
+        XCTAssertNoThrow(try encryptor.setKeyMap(["key-1": key1, "key-2": key2]))
+    }
+
+    // MARK: - Concurrent access
+
+    /// Multiple threads encrypting and decrypting simultaneously should not crash or corrupt data.
+    func testConcurrentEncryptDecrypt() throws {
+        let (encryptor, _) = try makeEncryptor()
+        let plaintext = Data("concurrent-test".utf8)
+        let iterations = 100
+
+        let group = DispatchGroup()
+        var errors = [Swift.Error]()
+        let errorLock = NSLock()
+
+        for i in 0 ..< iterations {
+            group.enter()
+            DispatchQueue.global().async {
+                defer { group.leave() }
+                do {
+                    let context = CassandraClient.EncryptionContext(
+                        keyspace: "test", table: "users", column: "col_\(i % 5)",
+                        primaryKey: Data("row-\(i)".utf8)
+                    )
+                    let encrypted = try encryptor.encrypt(plaintext, context: context)
+                    let decrypted = try encryptor.decrypt(encrypted, context: context)
+                    if decrypted != plaintext {
+                        errorLock.lock()
+                        errors.append(CassandraClient.Error.decryptionError("Data mismatch on iteration \(i)"))
+                        errorLock.unlock()
+                    }
+                } catch {
+                    errorLock.lock()
+                    errors.append(error)
+                    errorLock.unlock()
+                }
+            }
+        }
+
+        group.wait()
+        XCTAssertEqual(errors.count, 0, "Concurrent errors: \(errors)")
+    }
 }
