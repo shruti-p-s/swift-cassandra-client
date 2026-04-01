@@ -124,13 +124,19 @@ extension CassandraSession {
 }
 
 extension CassandraSession {
-    /// Returns a copy of options with the session's encryptor injected if not already set.
-    private func optionsWithEncryptor(_ options: CassandraClient.Statement.Options) -> CassandraClient.Statement.Options {
-        var opts = options
-        if #available(macOS 11.0, *), opts.encryptor == nil {
-            opts.encryptor = self.encryptor
-        }
-        return opts
+    /// Creates a Statement with the session's encryptor injected from Configuration.
+    @available(macOS 11.0, *)
+    private func makeStatement(
+        query: String,
+        parameters: [CassandraClient.Statement.Value],
+        options: CassandraClient.Statement.Options
+    ) throws -> CassandraClient.Statement {
+        try CassandraClient.Statement(
+            query: query,
+            parameters: parameters,
+            options: options,
+            _encryptor: self.encryptor
+        )
     }
 
     /// Run insert / update / delete or DDL command where no result is expected.
@@ -209,11 +215,12 @@ extension CassandraSession {
         logger: Logger? = .none
     ) -> EventLoopFuture<CassandraClient.Rows> {
         do {
-            let statement = try CassandraClient.Statement(
-                query: query,
-                parameters: parameters,
-                options: optionsWithEncryptor(options)
-            )
+            let statement: CassandraClient.Statement
+            if #available(macOS 11.0, *) {
+                statement = try self.makeStatement(query: query, parameters: parameters, options: options)
+            } else {
+                statement = try CassandraClient.Statement(query: query, parameters: parameters, options: options)
+            }
             return self.execute(statement: statement, on: eventLoop, logger: logger)
         } catch {
             let eventLoop = eventLoop ?? eventLoopGroup.next()
@@ -233,11 +240,12 @@ extension CassandraSession {
         logger: Logger? = .none
     ) -> EventLoopFuture<CassandraClient.PaginatedRows> {
         do {
-            let statement = try CassandraClient.Statement(
-                query: query,
-                parameters: parameters,
-                options: optionsWithEncryptor(options)
-            )
+            let statement: CassandraClient.Statement
+            if #available(macOS 11.0, *) {
+                statement = try self.makeStatement(query: query, parameters: parameters, options: options)
+            } else {
+                statement = try CassandraClient.Statement(query: query, parameters: parameters, options: options)
+            }
             return self.execute(statement: statement, pageSize: pageSize, on: eventLoop, logger: logger)
         } catch {
             let eventLoop = eventLoop ?? eventLoopGroup.next()
@@ -519,10 +527,10 @@ extension CassandraSession {
         options: CassandraClient.Statement.Options = .init(),
         logger: Logger? = .none
     ) async throws -> CassandraClient.Rows {
-        let statement = try CassandraClient.Statement(
+        let statement = try self.makeStatement(
             query: query,
             parameters: parameters,
-            options: optionsWithEncryptor(options)
+            options: options
         )
         return try await self.execute(statement: statement, logger: logger)
     }
@@ -536,10 +544,10 @@ extension CassandraSession {
         options: CassandraClient.Statement.Options = .init(),
         logger: Logger? = .none
     ) async throws -> CassandraClient.PaginatedRows {
-        let statement = try CassandraClient.Statement(
+        let statement = try self.makeStatement(
             query: query,
             parameters: parameters,
-            options: optionsWithEncryptor(options)
+            options: options
         )
         return try await self.execute(statement: statement, pageSize: pageSize, logger: logger)
     }

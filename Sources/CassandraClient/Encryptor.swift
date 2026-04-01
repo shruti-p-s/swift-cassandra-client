@@ -40,10 +40,15 @@ extension CassandraClient {
 
         var contextString: String { "\(self.keyspace).\(self.table).\(self.column)" }
 
-        // TODO: Add convenience method like withColumn("credit_card") to create a new context
-        // with a different column but same keyspace, table, and primaryKey.
-        // TODO: Add convenience method like withPrimaryKey(Data(...)) to create a new context
-        // with a different primary key but same keyspace, table, and column.
+        /// Returns a new context with a different column, keeping keyspace, table, and primaryKey.
+        public func withColumn(_ column: String) -> EncryptionContext {
+            EncryptionContext(keyspace: self.keyspace, table: self.table, column: column, primaryKey: self.primaryKey)
+        }
+
+        /// Returns a new context with a different primaryKey, keeping keyspace, table, and column.
+        public func withPrimaryKey(_ primaryKey: Data) -> EncryptionContext {
+            EncryptionContext(keyspace: self.keyspace, table: self.table, column: self.column, primaryKey: primaryKey)
+        }
     }
 }
 
@@ -306,7 +311,7 @@ extension CassandraClient {
                 throw CassandraClient.Error.decryptionError("Invalid key name encoding")
             }
 
-            guard envelope.count - offset > Self.nonceSize + 16 else {
+            guard envelope.count - offset >= Self.nonceSize + 16 else {
                 throw CassandraClient.Error.decryptionError("Envelope too small for nonce + ciphertext + tag")
             }
 

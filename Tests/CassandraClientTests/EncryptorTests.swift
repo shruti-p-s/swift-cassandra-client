@@ -67,10 +67,9 @@ final class EncryptorTests: XCTestCase {
     func testContextBinding() throws {
         let (encryptor, _) = try makeEncryptor()
         let plaintext = Data("secret-value".utf8)
-        let primaryKey = Data("row-1".utf8)
 
-        let ssnContext = testContext(column: "ssn", primaryKey: primaryKey)
-        let ccContext = testContext(column: "credit_card", primaryKey: primaryKey)
+        let ssnContext = testContext(column: "ssn")
+        let ccContext = ssnContext.withColumn("credit_card")
 
         let encryptedSSN = try encryptor.encrypt(plaintext, context: ssnContext)
         let encryptedCC = try encryptor.encrypt(plaintext, context: ccContext)
@@ -84,7 +83,7 @@ final class EncryptorTests: XCTestCase {
         let plaintext = Data("secret-value".utf8)
 
         let context1 = testContext(primaryKey: Data("row-1".utf8))
-        let context2 = testContext(primaryKey: Data("row-2".utf8))
+        let context2 = context1.withPrimaryKey(Data("row-2".utf8))
 
         let encrypted1 = try encryptor.encrypt(plaintext, context: context1)
         let encrypted2 = try encryptor.encrypt(plaintext, context: context2)
