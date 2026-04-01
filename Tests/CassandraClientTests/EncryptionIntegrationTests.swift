@@ -59,6 +59,8 @@ final class EncryptionIntegrationTests: XCTestCase {
             currentKeyName: keyName
         )
 
+        self.configuration.encryptor = self.encryptor
+
         var logger = Logger(label: "test")
         logger.logLevel = .debug
 
@@ -104,7 +106,7 @@ final class EncryptionIntegrationTests: XCTestCase {
         )
 
         var options = CassandraClient.Statement.Options()
-        options.encryptor = self.encryptor
+
 
         try session.run(
             "insert into \(tableName) (user_id, secret) values (?, ?)",
@@ -157,7 +159,6 @@ final class EncryptionIntegrationTests: XCTestCase {
         )
 
         var writeOptions = CassandraClient.Statement.Options()
-        writeOptions.encryptor = self.encryptor
 
         try session.run(
             "insert into \(tableName) (user_id, secret) values (?, ?)",
@@ -170,7 +171,6 @@ final class EncryptionIntegrationTests: XCTestCase {
 
         // Read back using Codable path
         var readOptions = CassandraClient.Statement.Options()
-        readOptions.encryptor = self.encryptor
         readOptions.encryptionContextBuilder = { row in
             guard let uid: String = row.column("user_id") else {
                 throw CassandraClient.Error.badParams("user_id not found in row")
@@ -222,7 +222,7 @@ final class EncryptionIntegrationTests: XCTestCase {
         }
 
         var options = CassandraClient.Statement.Options()
-        options.encryptor = self.encryptor
+
 
         try session.run(
             "insert into \(tableName) (user_id, enc_name, enc_age, enc_count, enc_score, enc_id, enc_data) values (?, ?, ?, ?, ?, ?, ?)",
@@ -272,7 +272,7 @@ final class EncryptionIntegrationTests: XCTestCase {
         ]
 
         var options = CassandraClient.Statement.Options()
-        options.encryptor = self.encryptor
+
         options.encryptionContextBuilder = { row in
             guard let uid: String = row.column("user_id") else {
                 throw CassandraClient.Error.badParams("user_id not found in row")
@@ -336,7 +336,7 @@ final class EncryptionIntegrationTests: XCTestCase {
         }
 
         var options = CassandraClient.Statement.Options()
-        options.encryptor = self.encryptor
+
         options.encryptionContextBuilder = { row in
             guard let uid: String = row.column("user_id") else {
                 throw CassandraClient.Error.badParams("user_id not found in row")
@@ -388,7 +388,7 @@ final class EncryptionIntegrationTests: XCTestCase {
 
         // Step 1: Write with key-1 (the encryptor from setUp uses "test-key")
         var options = CassandraClient.Statement.Options()
-        options.encryptor = self.encryptor
+
 
         try session.run(
             "insert into \(tableName) (user_id, secret) values (?, ?)",
