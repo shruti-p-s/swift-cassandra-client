@@ -14,6 +14,7 @@ jobs:
     with:
       license_header_check_project_name: "Swift Cassandra Client"
       api_breakage_check_enabled: false
+      docs_check_container_image: "swift:6.3-noble"
 
   unit-tests:
     name: Unit tests
